@@ -1,4 +1,3 @@
-
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/fs.h>
@@ -11,9 +10,10 @@ static struct inode *vtfs_get_inode(
     struct super_block *sb,
     const struct inode *dir,
     umode_t mode,
-    unsigned long ino){
+    unsigned long ino)
+{
     struct inode *inode = new_inode(sb);
-    
+
     if (!inode)
         return NULL;
     inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
@@ -21,6 +21,39 @@ static struct inode *vtfs_get_inode(
 
     return inode;
 }
+
+static struct dentry *vtfs_lookup(
+    struct inode *parent_inode,
+    struct dentry *child_dentry,
+    unsigned int flags)
+{
+    return NULL;
+}
+
+static int vtfs_iterate(
+    struct file *file,
+    struct dir_context *ctx)
+{
+    if (!dir_emit_dots(file, ctx))
+        return 0;
+
+    if (ctx->pos == 2) {
+        if (!dir_emit(ctx, "test.txt", 8, 1001, DT_REG))
+            return 0;
+
+        ctx->pos++;
+    }
+
+    return 0;
+}
+
+static const struct inode_operations vtfs_inode_ops = {
+    .lookup = vtfs_lookup,
+};
+
+static const struct file_operations vtfs_dir_ops = {
+    .iterate_shared = vtfs_iterate,
+};
 
 static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
@@ -31,9 +64,12 @@ static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize = PAGE_SIZE;
     sb->s_blocksize_bits = PAGE_SHIFT;
 
-    inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0755, 1000);
+    inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, 1000);
     if (!inode)
         return -ENOMEM;
+
+    inode->i_op = &vtfs_inode_ops;
+    inode->i_fop = &vtfs_dir_ops;
 
     sb->s_root = d_make_root(inode);
     if (!sb->s_root)
@@ -44,7 +80,8 @@ static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     return 0;
 }
 
-static int vtfs_get_tree(struct fs_context *fc){
+static int vtfs_get_tree(struct fs_context *fc)
+{
     return get_tree_nodev(fc, vtfs_fill_super);
 }
 
