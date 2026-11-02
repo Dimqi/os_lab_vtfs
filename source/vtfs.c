@@ -3,8 +3,12 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/pagemap.h>
+#include <linux/string.h>
 
 #define VTFS_MAGIC 0x76544653
+#define VTFS_ROOT_INO 1000
+#define VTFS_FILE_INO 1001
+#define VTFS_DIR_INO 200
 
 static struct inode *vtfs_get_inode(
     struct super_block *sb,
@@ -16,6 +20,7 @@ static struct inode *vtfs_get_inode(
 
     if (!inode)
         return NULL;
+
     inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
     inode->i_ino = ino;
 
@@ -25,10 +30,8 @@ static struct inode *vtfs_get_inode(
 static struct dentry *vtfs_lookup(
     struct inode *parent_inode,
     struct dentry *child_dentry,
-    unsigned int flags)
-{
-    return NULL;
-}
+    unsigned int flags
+);
 
 static int vtfs_iterate(
     struct file *file,
@@ -37,8 +40,18 @@ static int vtfs_iterate(
     if (!dir_emit_dots(file, ctx))
         return 0;
 
+    if (file_inode(file)->i_ino != VTFS_ROOT_INO)
+        return 0;
+
     if (ctx->pos == 2) {
-        if (!dir_emit(ctx, "test.txt", 8, 1001, DT_REG))
+        if (!dir_emit(ctx, "test.txt", 8, VTFS_FILE_INO, DT_REG))
+            return 0;
+
+        ctx->pos++;
+    }
+
+    if (ctx->pos == 3) {
+        if (!dir_emit(ctx, "dir", 3, VTFS_DIR_INO, DT_DIR))
             return 0;
 
         ctx->pos++;
@@ -55,6 +68,45 @@ static const struct file_operations vtfs_dir_ops = {
     .iterate_shared = vtfs_iterate,
 };
 
+static struct dentry *vtfs_lookup(
+    struct inode *parent_inode,
+    struct dentry *child_dentry,
+    unsigned int flags)
+{
+    struct inode *inode = NULL;
+    const char *name = child_dentry->d_name.name;
+
+    if (parent_inode->i_ino == VTFS_ROOT_INO) {
+        if (!strcmp(name, "test.txt")) {
+            inode = vtfs_get_inode(
+                parent_inode->i_sb,
+                parent_inode,
+                S_IFREG | 0777,
+                VTFS_FILE_INO
+            );
+        } else if (!strcmp(name, "dir")) {
+            inode = vtfs_get_inode(
+                parent_inode->i_sb,
+                parent_inode,
+                S_IFDIR | 0777,
+                VTFS_DIR_INO
+            );
+
+            if (inode) {
+                inode->i_op = &vtfs_inode_ops;
+                inode->i_fop = &vtfs_dir_ops;
+            }
+        }
+    }
+
+    if (inode == NULL && (!strcmp(name, "test.txt") || !strcmp(name, "dir")))
+        return ERR_PTR(-ENOMEM);
+
+    d_add(child_dentry, inode);
+
+    return NULL;
+}
+
 static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
     struct inode *inode;
@@ -64,7 +116,7 @@ static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize = PAGE_SIZE;
     sb->s_blocksize_bits = PAGE_SHIFT;
 
-    inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, 1000);
+    inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, VTFS_ROOT_INO);
     if (!inode)
         return -ENOMEM;
 
