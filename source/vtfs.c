@@ -22,6 +22,7 @@ struct vtfs_entry {
     umode_t mode;
     char *data;
     size_t size;
+    bool data_owner;
     struct list_head list;
 };
 
@@ -56,8 +57,11 @@ static struct dentry *vtfs_lookup(
     unsigned int flags)
 {
     struct vtfs_entry *entry;
+    struct vtfs_entry *linked_entry;
     struct inode *inode = NULL;
     const char *name = child_dentry->d_name.name;
+    unsigned int link_count;
+    size_t file_size;
     bool found = false;
 
     mutex_lock(&vtfs_mutex);
@@ -78,11 +82,26 @@ static struct dentry *vtfs_lookup(
                     inode->i_op = &vtfs_inode_ops;
                     inode->i_fop = &vtfs_dir_ops;
                     set_nlink(inode, 2);
+                    i_size_write(inode, entry->size);
                 } else {
+                    inode->i_op = &vtfs_inode_ops;
                     inode->i_fop = &vtfs_file_ops;
-                }
 
-                i_size_write(inode, entry->size);
+                    link_count = 0;
+                    file_size = 0;
+
+                    list_for_each_entry(linked_entry, &vtfs_entries, list) {
+                        if (linked_entry->ino == entry->ino) {
+                            link_count++;
+
+                            if (linked_entry->data_owner)
+                                file_size = linked_entry->size;
+                        }
+                    }
+
+                    set_nlink(inode, link_count);
+                    i_size_write(inode, file_size);
+                }
             }
 
             found = true;
@@ -148,11 +167,13 @@ static int vtfs_create(
         return -ENOMEM;
     }
 
+    inode->i_op = &vtfs_inode_ops;
     inode->i_fop = &vtfs_file_ops;
 
     new_entry->ino = vtfs_next_ino;
     new_entry->parent_ino = parent_inode->i_ino;
     new_entry->mode = S_IFREG | (mode & 0777);
+    new_entry->data_owner = true;
     strscpy(new_entry->name, name, sizeof(new_entry->name));
 
     list_add_tail(&new_entry->list, &vtfs_entries);
@@ -235,12 +256,82 @@ static struct dentry *vtfs_mkdir(
     return NULL;
 }
 
+static int vtfs_link(
+    struct dentry *old_dentry,
+    struct inode *parent_dir,
+    struct dentry *new_dentry)
+{
+    struct inode *inode;
+    struct vtfs_entry *entry;
+    struct vtfs_entry *new_entry;
+    const char *name = new_dentry->d_name.name;
+    bool found = false;
+
+    inode = d_inode(old_dentry);
+
+    if (!inode)
+        return -ENOENT;
+
+    if (S_ISDIR(inode->i_mode))
+        return -EPERM;
+
+    if (!S_ISDIR(parent_dir->i_mode))
+        return -ENOTDIR;
+
+    if (strnlen(name, VTFS_NAME_LEN) >= VTFS_NAME_LEN)
+        return -ENAMETOOLONG;
+
+    mutex_lock(&vtfs_mutex);
+
+    list_for_each_entry(entry, &vtfs_entries, list) {
+        if (entry->parent_ino == parent_dir->i_ino &&
+            !strcmp(entry->name, name)) {
+            mutex_unlock(&vtfs_mutex);
+            return -EEXIST;
+        }
+
+        if (entry->ino == inode->i_ino)
+            found = true;
+    }
+
+    if (!found) {
+        mutex_unlock(&vtfs_mutex);
+        return -ENOENT;
+    }
+
+    new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+
+    if (!new_entry) {
+        mutex_unlock(&vtfs_mutex);
+        return -ENOMEM;
+    }
+
+    new_entry->ino = inode->i_ino;
+    new_entry->parent_ino = parent_dir->i_ino;
+    new_entry->mode = inode->i_mode;
+    new_entry->data_owner = false;
+
+    strscpy(new_entry->name, name, sizeof(new_entry->name));
+
+    list_add_tail(&new_entry->list, &vtfs_entries);
+
+    inc_nlink(inode);
+
+    ihold(inode);
+    d_instantiate(new_dentry, inode);
+
+    mutex_unlock(&vtfs_mutex);
+
+    return 0;
+}
+
 static int vtfs_unlink(
     struct inode *parent_inode,
     struct dentry *child_dentry)
 {
     struct vtfs_entry *entry;
     struct vtfs_entry *found_entry = NULL;
+    struct vtfs_entry *replacement = NULL;
     struct inode *inode;
 
     inode = d_inode(child_dentry);
@@ -263,11 +354,28 @@ static int vtfs_unlink(
         return -ENOENT;
     }
 
+    list_for_each_entry(entry, &vtfs_entries, list) {
+        if (entry != found_entry && entry->ino == found_entry->ino) {
+            replacement = entry;
+            break;
+        }
+    }
+
+    if (found_entry->data_owner) {
+        if (replacement) {
+            replacement->data = found_entry->data;
+            replacement->size = found_entry->size;
+            replacement->data_owner = true;
+
+            found_entry->data = NULL;
+        } else {
+            kfree(found_entry->data);
+        }
+    }
+
     drop_nlink(inode);
 
     list_del(&found_entry->list);
-
-    kfree(found_entry->data);
     kfree(found_entry);
 
     mutex_unlock(&vtfs_mutex);
@@ -336,7 +444,7 @@ static ssize_t vtfs_read(
     mutex_lock(&vtfs_mutex);
 
     list_for_each_entry(entry, &vtfs_entries, list) {
-        if (entry->ino == ino) {
+        if (entry->ino == ino && entry->data_owner) {
             result = simple_read_from_buffer(
                 buffer,
                 count,
@@ -374,7 +482,7 @@ static ssize_t vtfs_write(
     mutex_lock(&vtfs_mutex);
 
     list_for_each_entry(entry, &vtfs_entries, list) {
-        if (entry->ino != ino)
+        if (entry->ino != ino || !entry->data_owner)
             continue;
 
         if (file->f_flags & O_APPEND)
@@ -484,12 +592,41 @@ static int vtfs_iterate(
     return 0;
 }
 
+static int vtfs_setattr(
+    struct mnt_idmap *idmap,
+    struct dentry *dentry,
+    struct iattr *attr)
+{
+    struct inode *inode = d_inode(dentry);
+    struct vtfs_entry *entry;
+
+    if (attr->ia_valid & ATTR_SIZE) {
+        mutex_lock(&vtfs_mutex);
+
+        list_for_each_entry(entry, &vtfs_entries, list) {
+            if (entry->ino == inode->i_ino && entry->data_owner) {
+                kfree(entry->data);
+                entry->data = NULL;
+                entry->size = 0;
+                i_size_write(inode, 0);
+                break;
+            }
+        }
+
+        mutex_unlock(&vtfs_mutex);
+    }
+
+    return 0;
+}
+
 static const struct inode_operations vtfs_inode_ops = {
     .lookup = vtfs_lookup,
     .create = vtfs_create,
     .mkdir = vtfs_mkdir,
+    .link = vtfs_link,
     .unlink = vtfs_unlink,
     .rmdir = vtfs_rmdir,
+    .setattr = vtfs_setattr,
 };
 
 static const struct file_operations vtfs_file_ops = {
@@ -502,8 +639,7 @@ static const struct file_operations vtfs_dir_ops = {
     .iterate_shared = vtfs_iterate,
 };
 
-static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
-{
+static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc){
     struct inode *inode;
 
     sb->s_magic = VTFS_MAGIC;
@@ -534,8 +670,7 @@ static int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     return 0;
 }
 
-static int vtfs_get_tree(struct fs_context *fc)
-{
+static int vtfs_get_tree(struct fs_context *fc){
     return get_tree_nodev(fc, vtfs_fill_super);
 }
 
@@ -543,14 +678,12 @@ static const struct fs_context_operations vtfs_context_operations = {
     .get_tree = vtfs_get_tree,
 };
 
-static int vtfs_init_fs_context(struct fs_context *fc)
-{
+static int vtfs_init_fs_context(struct fs_context *fc){
     fc->ops = &vtfs_context_operations;
     return 0;
 }
 
-static void vtfs_kill_sb(struct super_block *sb)
-{
+static void vtfs_kill_sb(struct super_block *sb){
     struct vtfs_entry *entry;
     struct vtfs_entry *tmp;
 
@@ -576,18 +709,14 @@ static struct file_system_type vtfs_type = {
     .kill_sb = vtfs_kill_sb,
 };
 
-static int __init vtfs_init(void)
-{
+static int __init vtfs_init(void){
     int error = register_filesystem(&vtfs_type);
-
     if (error)
         return error;
-
     return 0;
 }
 
-static void __exit vtfs_exit(void)
-{
+static void __exit vtfs_exit(void){
     unregister_filesystem(&vtfs_type);
 }
 
